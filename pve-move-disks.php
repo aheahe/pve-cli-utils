@@ -11,6 +11,7 @@ PmUtils::usage()."
 -d dest storage (required)
 -s source storage
 -t target format (raw, qcow2, vmdk)
+-R Only migrate running nodes
 ";
     exit();
 }

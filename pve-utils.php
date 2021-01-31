@@ -1,24 +1,35 @@
 <?php
 
-require_once 'vendor/autoload.php';
+require_once 'Proxmox.php';
 
 class PmUtils {
 
   private $logintime;
   private $storages;
   private $proxmox;
+  private $nodes;
 
   public function __construct($auth) {
     $this->login($auth);
 
-    $storages = $this->proxmox->getStorages()['data'];
+    $this->nodes = $this->proxmox->request("/nodes");
+    $storages = $this->proxmox->request("/storage");
 
     $this->storages = array_filter($storages, function($storage) {
-      return (strpos($storage['content'], "images") !== false);
+      return (strpos($storage->content, "images") !== false);
     });
+
   }
 
-  public static function options($opts) {
+  public function getNodes() {
+    return $this->nodes;
+  }
+
+  public function getStorages() {
+    return $this->storages;
+  }
+
+  public static function options($opts = "") {
     return getOpt("h:u:p:r:P:n".$opts);
   }
 
@@ -48,64 +59,58 @@ class PmUtils {
 -n Dry run";
   }
 
-  private function setLoginTime() {
-    $this->logintime = microtime(true);
-  }
-
   private function login($auth) {
     try {
-      $this->proxmox = new ProxmoxVE\Proxmox([
-        'hostname' => $auth['hostname'],
-        'username' => $auth['username'],
-        'password' => $auth['password'],
-        'realm' => $auth['realm'],
-        'port' => $auth['port']]
-      );
-    }
-    catch (ProxmoxVE\Exception\AuthenticationException $e) {
-      echo "Username, Password or Realm incorrect\n";
-      exit();
-    }
-    catch (Exception $e) {
+      $this->proxmox = new Proxmox($auth['hostname'], $auth['username'], $auth['password'], $auth['realm'], $auth['port']);
+    } catch (Exception $e) {
+      //var_dump($e);
       echo $e->getMessage()."\n";
       exit();
     }
 
-    $this->setLoginTime();
   }
 
-  private function setCredentials() {
-    $this->proxmox->setCredentials($this->proxmox->getCredentials());
-    $this->setLoginTime();
+  public function getConfig($vm) {
+    return $this->proxmox->request("/nodes/{$vm->node}/{$vm->id}/config");
   }
 
-  private function getConfig($vm) {
-    $config = $this->proxmox->get("/nodes/{$vm['node']}/{$vm['id']}/config")['data'];
-
-    ksort($config, SORT_NATURAL);
-
-    return $config;
+  public function getStatus($node) {
+    return $this->proxmox->request("/nodes/$node/status");
   }
 
   public function storageExists($name) {
     foreach ($this->storages as $storage)
-      if ($name === $storage['storage']) return true;
+      if ($name === $storage->storage) return true;
     return false;
   }
 
-  public function virtualMachines() {
+  public function getNode($name) {
+    foreach ($this->nodes as $node)
+      if ($node->node === $name) return $node;
+    return false;
+  }
 
-    $allVm = $this->proxmox->get("/cluster/resources", array(["type" => "vm"]))['data'];
+  public function virtualMachines($running=false) {
 
-    $allVm = array_filter($allVm, function($vm) {
-      return ($vm['type']==="qemu");
+    $allVm = $this->proxmox->request("/cluster/resources", "GET", ["type" => "vm"]);
+
+    $result = array();
+
+    foreach ($allVm as $vm) {
+      if ($vm->type!=="qemu") continue;
+      if ($running && $vm->status!=="running") continue;
+      $result[$vm->vmid] = $vm;
+    }
+
+    ksort($result);
+
+    return $result;
+  }
+
+  public function nodeVirtalMachines($node, $running=false) {
+    return array_filter($this->virtualMachines($running), function($vm) use ($node) {
+      return ($vm->node === $node);
     });
-
-    usort($allVm, function($a, $b) {
-      return $a['vmid']-$b['vmid'];
-    });
-
-    return $allVm;
   }
 
 
@@ -124,14 +129,15 @@ class PmUtils {
 
       foreach($config as $key => $val) {
 
-        if (!preg_match("/^(unused|ide|scsi|virtio|sata)\d{1,2}/", $key)) continue;
+        if (!preg_match("/^(efidisk|unused|ide|scsi|virtio|sata)\d{1,2}/", $key)) continue;
         if ($storage && strpos($val, $storage) !== 0) continue;
 
         $res = [
-          "nodename" => $vm['node'],
-          "nodeid" => $vm['id'],
-          "vmname" => $vm['name'],
-          "vmid" => $vm['vmid'],
+          "nodename" => $vm->node,
+          "nodeid" => $vm->id,
+          "vmname" => $vm->name,
+          "vmid" => $vm->vmid,
+          "vm" => $vm,
           "disk" => $key,
           "content" => $val
         ];
@@ -157,10 +163,10 @@ class PmUtils {
 
   public function activeTasks() {
     $active = 0;
-    $tasks =  $this->proxmox->get("/cluster/tasks");
+    $tasks =  $this->proxmox->request("/cluster/tasks");
 
-    foreach ($tasks['data'] as $task)
-      if (!isset($task['endtime'])) $active++;
+    foreach ($tasks as $task)
+      if (!isset($task->endtime)) $active++;
 
     return $active;
   }
@@ -171,9 +177,20 @@ class PmUtils {
       sleep(3);
 
       // Proxmox times out after 2h - relogin every 1h
-      if (microtime(true) - $this->logintime > 3600)
-        $this->setCredentials();
-    }
+      if (microtime(true) - $this->proxmox->logintime > 3600)
+         $this->proxmox->login();
+      }
+  }
+
+  public function migrateVm($vm, $targetNode) {
+
+    $args = [
+      "target" => $targetNode,
+      "migration_type" => "insecure",
+      "online" => true
+    ];
+
+    $this->proxmox->request("/nodes/{$vm->node}/{$vm->id}/migrate", "POST", $args);
   }
 
   public function moveDisk($disk, $dstorage, $format) {
@@ -185,16 +202,30 @@ class PmUtils {
 
     if ($format) $args["format"] = $format;
 
-    $this->proxmox->create("/nodes/{$disk['nodename']}/{$disk['nodeid']}/move_disk", $args);
+    $this->proxmox->request("/nodes/{$disk['nodename']}/{$disk['nodeid']}/move_disk", "POST", $args);
   }
 
   public function deleteDisk($disk) {
-    $this->proxmox->set("/nodes/{$disk['nodename']}/{$disk['nodeid']}/config", array(["delete" => $disk['disk']]));
+    $this->proxmox->request("/nodes/{$disk['nodename']}/{$disk['nodeid']}/config", "PUT", ["delete" => $disk['disk']]);
   }
 
   public function ejectCdrom($disk) {
-    $this->proxmox->set("/nodes/{$disk['nodename']}/{$disk['nodeid']}/config", array([$disk["disk"] => "none,media=cdrom"]));
+    $this->proxmox->request("/nodes/{$disk['nodename']}/{$disk['nodeid']}/config", "PUT", [$disk["disk"] => "none,media=cdrom"]);
   }
+
+  public function setName($vm, $name) {
+    $this->proxmox->request("/nodes/{$vm->node}/qemu/{$vm->vmid}/config", "PUT", ["name" => $name]);
+  }
+
+  public function disableVm($vm) {
+    $this->proxmox->request("/nodes/{$vm->node}/qemu/{$vm->vmid}/config", "PUT", ["args" => "MIGRATED-AND-DISABLED"]);
+  }
+
+  public function startVm($vm) {
+    $this->proxmox->request("/nodes/{$vm->node}/qemu/{$vm->vmid}/status/start", "POST");
+  }
+
+
 
 }
 
